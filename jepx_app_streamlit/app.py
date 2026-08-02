@@ -53,18 +53,24 @@ if spot_file is not None:
 
 
 # ============================================
-# ブロック2：spot_summary の最新日を前日として df_prev を作成
+# ブロック2：spot_summary の過去3日を df_prev として作成
 # ============================================
 
 if spot_file is not None:
     # 最新日を取得
     latest_date = df_spot["受渡日"].max()
 
-    # 最新日のデータだけ抽出
-    mask = df_area["datetime"].dt.date == latest_date.date()
+    # ★ 過去3日分を抽出
+    start_date = latest_date - pd.Timedelta(days=3)
+
+    mask = (
+        (df_area["datetime"].dt.date >= start_date.date()) &
+        (df_area["datetime"].dt.date <= latest_date.date())
+    )
+
     df_prev = df_area[mask].copy()
 
-    # slot（1〜48）を付与
+    # slot（1〜48）
     df_prev["slot"] = (
         df_prev["datetime"].dt.hour * 2 +
         (df_prev["datetime"].dt.minute // 30) +
@@ -73,7 +79,7 @@ if spot_file is not None:
 
     df_prev = df_prev.sort_values(["area", "slot"])
 
-    st.write("前日スポット（df_prev）")
+    st.write("過去3日分スポット（df_prev）")
     st.dataframe(df_prev.head())
 
 # ============================================
@@ -145,20 +151,19 @@ if spot_file is not None and short_file is not None:
     st.dataframe(df_pred2.head())
 
 # ============================================
-# ブロック6：前日＋予測日1＋予測日2を結合
+# ブロック6：過去3日＋予測日1＋予測日2を結合
 # ============================================
 
 if spot_file is not None and short_file is not None:
-    df_prev_use = df_prev[df_prev["datetime"].dt.date == prev_date][
-        ["datetime", "area", "jepx_price", "reserve_ratio"]
-    ].copy()
+    # ★ フィルタを消す（過去3日分すべてを使う）
+    df_prev_use = df_prev[["datetime", "area", "jepx_price", "reserve_ratio"]].copy()
 
     df_all = pd.concat(
         [df_prev_use, df_pred1, df_pred2],
         ignore_index=True
     )
 
-    st.write("df_all（前日＋翌日＋翌々日）")
+    st.write("df_all（過去3日＋翌日＋翌々日）")
     st.dataframe(df_all.head())
 
 # ============================================
@@ -179,7 +184,7 @@ area_coords = {
 
 
 # ============================================
-# ブロック8：気象データ取得 → 補間 → df_all に結合
+# ブロック8：気象データ取得 → 補間 → df_all に結合（過去3日＋予測日2まで）
 # ============================================
 
 import requests
@@ -205,11 +210,13 @@ def interpolate_weather(weather_json):
     return df.reset_index()
 
 if spot_file is not None and short_file is not None:
-    end_date_extended = (pd.to_datetime(pred1_date) + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+    # ★ 過去3日分＋予測日2まで
+    start_date_weather = (prev_date - pd.Timedelta(days=3)).strftime("%Y-%m-%d")
+    end_date_weather   = (pred1_date + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
 
     weather_all = []
     for area, (lat, lon) in area_coords.items():
-        wjson = fetch_weather(lat, lon, prev_date, end_date_extended)
+        wjson = fetch_weather(lat, lon, start_date_weather, end_date_weather)
         wdf = interpolate_weather(wjson)
         wdf["area"] = area
         weather_all.append(wdf)
@@ -287,34 +294,157 @@ if spot_file is not None and short_file is not None:
 
 
 # ============================================
-# ブロック11：予測日1モデル用の特徴量生成
+# ブロック11：予測日1モデル用の特徴量生成（学習コードと完全一致）
 # ============================================
 
 if spot_file is not None and short_file is not None and weekly_file is not None:
 
-    # slot（datetime の日付ごとに 0〜47）
-    df_all["slot"] = df_all.groupby(df_all["datetime"].dt.date).cumcount()
+    import numpy as np
 
-    # 3コマ移動平均
-    df_all["jepx_price_prev_ma3"] = (
-        df_all.groupby("area")["jepx_price"]
-              .rolling(3)
-              .mean()
-              .reset_index(0, drop=True)
+    # -----------------------------
+    # ① slot（30分コマ番号）
+    # -----------------------------
+    df_all["slot"] = df_all["datetime"].dt.hour * 2 + df_all["datetime"].dt.minute // 30
+
+    # -----------------------------
+    # ② 平日・休日フラグ
+    # -----------------------------
+    df_all["is_holiday_like"] = ((df_all["weekday"] >= 5) | (df_all["holiday"] == 1)).astype(int)
+
+    # -----------------------------
+    # ③ 平日ラグ（48コマ前）
+    # -----------------------------
+    df_weekday = df_all[df_all["is_holiday_like"] == 0].copy()
+    df_weekday["price_prev_weekday"] = df_weekday.groupby("area")["jepx_price"].shift(48)
+
+    # -----------------------------
+    # ④ 休日ラグ（48コマ前）
+    # -----------------------------
+    df_holiday = df_all[df_all["is_holiday_like"] == 1].copy()
+    df_holiday["price_prev_holiday"] = df_holiday.groupby("area")["jepx_price"].shift(48)
+
+    # -----------------------------
+    # ⑤ マージ（48コマ前）
+    # -----------------------------
+    df_all = df_all.merge(
+        df_weekday[["datetime", "area", "price_prev_weekday"]],
+        on=["datetime", "area"],
+        how="left"
     )
 
-    df_all["reserve_ratio_prev"] = df_all.groupby("area")["reserve_ratio"].shift(1)
+    df_all = df_all.merge(
+        df_holiday[["datetime", "area", "price_prev_holiday"]],
+        on=["datetime", "area"],
+        how="left"
+    )
+
+    # -----------------------------
+    # ⑥ 前日価格・気象（48コマ前）
+    # -----------------------------
+    df_all["jepx_price_prev"] = df_all.groupby("area")["jepx_price"].shift(48)
+
+    df_all["jepx_price_prev_ma3"] = (
+        df_all.groupby("area")["jepx_price_prev"]
+              .rolling(3)
+              .mean()
+              .reset_index(level=0, drop=True)
+    )
+
+    df_all["temp_prev"]  = df_all.groupby("area")["temp"].shift(48)
+    df_all["solar_prev"] = df_all.groupby("area")["solar"].shift(48)
+
+    df_all["temp_diff"]  = df_all["temp"]  - df_all["temp_prev"]
+    df_all["solar_diff"] = df_all["solar"] - df_all["solar_prev"]
+
+    # -----------------------------
+    # ⑦ 予備率（48コマ前）
+    # -----------------------------
+    df_all["reserve_ratio_prev"] = df_all.groupby("area")["reserve_ratio"].shift(48)
     df_all["reserve_ratio_diff"] = df_all["reserve_ratio"] - df_all["reserve_ratio_prev"]
-    df_all["reserve_ratio_inv"] = 1 / (df_all["reserve_ratio"] + 1e-6)
-    df_all["reserve_low_gap"] = df_all["reserve_ratio"].apply(lambda x: max(0, 3 - x))
 
-    df_all["temp_diff"] = df_all.groupby("area")["temp"].diff()
-    df_all["solar_diff"] = df_all.groupby("area")["solar"].diff()
+    df_all["reserve_ratio_inv"] = 1.0 / (df_all["reserve_ratio"] + 1e-6)
 
-    df_all["price_prev_weekday"] = df_all.groupby("area")["jepx_price"].shift(48)
-    df_all["price_prev_holiday"] = df_all.groupby("area")["jepx_price"].shift(48)
+    threshold = 5.0
+    df_all["reserve_low_gap"] = np.maximum(0.0, threshold - df_all["reserve_ratio"])
 
-    st.write("予測日1モデル用の特徴量を追加しました")
+    # -----------------------------
+    # ⑧ 週間予備率（48コマ前）
+    # -----------------------------
+    df_all["weekly_max_reserve_prev"] = df_all.groupby("area")["weekly_max_reserve"].shift(48)
+    df_all["weekly_min_reserve_prev"] = df_all.groupby("area")["weekly_min_reserve"].shift(48)
+
+    df_all["weekly_max_reserve_diff"] = df_all["weekly_max_reserve"] - df_all["weekly_max_reserve_prev"]
+    df_all["weekly_min_reserve_diff"] = df_all["weekly_min_reserve"] - df_all["weekly_min_reserve_prev"]
+
+    # -----------------------------
+    # ⑨ 前々日（96コマ前）
+    # -----------------------------
+    df_all["jepx_price_prev_96"] = df_all.groupby("area")["jepx_price"].shift(96)
+
+    df_all["temp_prev_96"]  = df_all.groupby("area")["temp"].shift(96)
+    df_all["solar_prev_96"] = df_all.groupby("area")["solar"].shift(96)
+
+    df_all["temp_diff_96"]  = df_all["temp"]  - df_all["temp_prev_96"]
+    df_all["solar_diff_96"] = df_all["solar"] - df_all["solar_prev_96"]
+
+    df_all["reserve_ratio_prev_96"] = df_all.groupby("area")["reserve_ratio"].shift(96)
+    df_all["reserve_ratio_diff_96"] = df_all["reserve_ratio"] - df_all["reserve_ratio_prev_96"]
+
+    # 平日ラグ（96コマ前）
+    df_weekday_96 = df_all[df_all["is_holiday_like"] == 0].copy()
+    df_weekday_96["price_prev_weekday_96"] = df_weekday_96.groupby("area")["jepx_price"].shift(96)
+
+    df_all = df_all.merge(
+        df_weekday_96[["datetime", "area", "price_prev_weekday_96"]],
+        on=["datetime", "area"],
+        how="left"
+    )
+
+    # 休日ラグ（96コマ前）
+    df_holiday_96 = df_all[df_all["is_holiday_like"] == 1].copy()
+    df_holiday_96["price_prev_holiday_96"] = df_holiday_96.groupby("area")["jepx_price"].shift(96)
+
+    df_all = df_all.merge(
+        df_holiday_96[["datetime", "area", "price_prev_holiday_96"]],
+        on=["datetime", "area"],
+        how="left"
+    )
+
+    # -----------------------------
+    # ⑩ 欠損埋め（48系＋96系）
+    # -----------------------------
+    cols_fill_zero = [
+        "price_prev_weekday",
+        "price_prev_holiday",
+        "jepx_price_prev",
+        "jepx_price_prev_ma3",
+        "temp_prev",
+        "solar_prev",
+        "temp_diff",
+        "solar_diff",
+        "reserve_ratio_prev",
+        "reserve_ratio_diff",
+        "reserve_ratio_inv",
+        "reserve_low_gap",
+        "weekly_max_reserve_prev",
+        "weekly_min_reserve_prev",
+        "weekly_max_reserve_diff",
+        "weekly_min_reserve_diff",
+        "jepx_price_prev_96",
+        "temp_prev_96",
+        "solar_prev_96",
+        "temp_diff_96",
+        "solar_diff_96",
+        "reserve_ratio_prev_96",
+        "reserve_ratio_diff_96",
+        "price_prev_weekday_96",
+        "price_prev_holiday_96",
+    ]
+
+    df_all[cols_fill_zero] = df_all[cols_fill_zero].fillna(0)
+
+    st.write("予測日1モデル用の特徴量生成が完了しました")
+    st.dataframe(df_all.head())
 
 # ============================================
 # ブロック12：prediction_data_final.csv の保存
@@ -360,81 +490,6 @@ if 'df_all' in globals():
             mime="text/csv"
         )
 
-# ============================================
-# ブロック13：予測日2モデル用の特徴量生成（学習コードと一致）
-# ============================================
-
-if (
-    spot_file is not None
-    and short_file is not None
-    and "weekly_max_reserve" in df_all.columns
-    and "weekly_min_reserve" in df_all.columns
-):
-    import numpy as np
-
-    # is_holiday_like（学習時と同じ定義）
-    df_all["is_holiday_like"] = ((df_all["weekday"] >= 5) | (df_all["holiday"] == 1)).astype(int)
-
-    # 週間予備率（48コマ前）
-    df_all["weekly_max_reserve_prev"] = df_all.groupby("area")["weekly_max_reserve"].shift(48)
-    df_all["weekly_min_reserve_prev"] = df_all.groupby("area")["weekly_min_reserve"].shift(48)
-
-    df_all["weekly_max_reserve_diff"] = df_all["weekly_max_reserve"] - df_all["weekly_max_reserve_prev"]
-    df_all["weekly_min_reserve_diff"] = df_all["weekly_min_reserve"] - df_all["weekly_min_reserve_prev"]
-
-    # 前々日（96コマ前）の特徴量
-    df_all["jepx_price_prev_96"] = df_all.groupby("area")["jepx_price"].shift(96)
-
-    df_all["temp_prev_96"]  = df_all.groupby("area")["temp"].shift(96)
-    df_all["solar_prev_96"] = df_all.groupby("area")["solar"].shift(96)
-
-    df_all["temp_diff_96"]  = df_all["temp"]  - df_all["temp_prev_96"]
-    df_all["solar_diff_96"] = df_all["solar"] - df_all["solar_prev_96"]
-
-    df_all["reserve_ratio_prev_96"] = df_all.groupby("area")["reserve_ratio"].shift(96)
-    df_all["reserve_ratio_diff_96"] = df_all["reserve_ratio"] - df_all["reserve_ratio_prev_96"]
-
-    # 平日ラグ（96コマ前）
-    df_weekday_96 = df_all[df_all["is_holiday_like"] == 0].copy()
-    df_weekday_96["price_prev_weekday_96"] = df_weekday_96.groupby("area")["jepx_price"].shift(96)
-
-    df_all = df_all.merge(
-        df_weekday_96[["datetime", "area", "price_prev_weekday_96"]],
-        on=["datetime", "area"],
-        how="left"
-    )
-
-    # 休日ラグ（96コマ前）
-    df_holiday_96 = df_all[df_all["is_holiday_like"] == 1].copy()
-    df_holiday_96["price_prev_holiday_96"] = df_holiday_96.groupby("area")["jepx_price"].shift(96)
-
-    df_all = df_all.merge(
-        df_holiday_96[["datetime", "area", "price_prev_holiday_96"]],
-        on=["datetime", "area"],
-        how="left"
-    )
-
-    # 欠損埋め（48系＋96系）
-    cols_fill_zero = [
-        "weekly_max_reserve_prev",
-        "weekly_min_reserve_prev",
-        "weekly_max_reserve_diff",
-        "weekly_min_reserve_diff",
-        "jepx_price_prev_96",
-        "temp_prev_96",
-        "solar_prev_96",
-        "temp_diff_96",
-        "solar_diff_96",
-        "reserve_ratio_prev_96",
-        "reserve_ratio_diff_96",
-        "price_prev_weekday_96",
-        "price_prev_holiday_96",
-    ]
-
-    df_all[cols_fill_zero] = df_all[cols_fill_zero].fillna(0)
-
-    st.write("予測日2モデル用の特徴量を追加しました")
-    st.dataframe(df_all.head())
 
 
 # ============================================
