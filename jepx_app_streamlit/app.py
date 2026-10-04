@@ -132,11 +132,11 @@ if spot_file is not None:
     st.dataframe(df_prev.head())
 
 # ============================================
-# ブロック3：短期予備率CSVを読み込み、df_res2 を作成
+# ブロック3：翌々日予備率CSVを読み込み、df_res2 を作成
 # ============================================
 
 short_file = st.file_uploader(
-    "短期予備率CSVを選択（short_term_reserve.csv と同じ列構造）",
+    "翌々日予備率CSVを選択",
     type=["csv"]
 )
 
@@ -154,7 +154,7 @@ if short_file is not None:
     st.dataframe(df_res2.head())
 
 # ============================================
-# ブロック4：df_prev に短期予備率を結合
+# ブロック4：df_prev に翌々日予備率を結合
 # ============================================
 
 if spot_file is not None and short_file is not None:
@@ -165,7 +165,7 @@ if spot_file is not None and short_file is not None:
         df_prev["reserve_ratio"] = df_prev["reserve_ratio_y"]
         df_prev = df_prev.drop(columns=["reserve_ratio_x", "reserve_ratio_y"])
 
-    st.write("df_prev（短期予備率結合後）")
+    st.write("df_prev（翌々日予備率結合後）")
     st.dataframe(df_prev.head())
 
 # ============================================
@@ -394,7 +394,7 @@ if spot_file is not None and short_file is not None:
 # ============================================
 
 weekly_file = st.file_uploader(
-    "週間予備率CSVを選択（weekly_reserve.csv と同じ列構造）",
+    "週間予備率CSVを選択",
     type=["csv"]
 )
 
